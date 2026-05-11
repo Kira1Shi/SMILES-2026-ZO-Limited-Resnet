@@ -62,13 +62,24 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
+        lr: float = 3e-4,
+        eps: float = 3e-4,
         perturbation_mode: str = "gaussian",
+        momentum: float = 0.9,
+        betas: tuple[float, float] = (0.95, 0.999),
+        adam_eps: float = 1e-8
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
+        self.momentum = momentum
+        self.momentum_buffer: dict[str, torch.Tensor] = {}
+        self.betas = betas  # (beta1, beta2)
+        self.adam_eps = adam_eps
+        self.step_count = 0
+
+        self.m_buffer: dict[str, torch.Tensor] = {}  # First moment (mean)
+        self.v_buffer: dict[str, torch.Tensor] = {}  # Second moment (uncentered variance)
 
         if perturbation_mode not in ("gaussian", "uniform"):
             raise ValueError(
@@ -117,25 +128,6 @@ class ZeroOrderOptimizer:
             )
         return {n: named[n] for n in self.layer_names}
 
-    def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
-        """Sample a random unit-norm perturbation vector of the same shape as ``param``.
-
-        Args:
-            param: The parameter tensor whose shape determines the output shape.
-
-        Returns:
-            A tensor of the same shape as ``param``, normalised to unit L2 norm.
-        """
-        if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
-
-        norm = u.norm()
-        if norm > 0:
-            u = u / norm
-        return u
-
     def _estimate_grad(
         self,
         loss_fn: Callable[[], float],
@@ -171,28 +163,31 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the gradient estimation below.
         # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+
+        original_vals = {name: param.data.clone() for name, param in params.items()}
+
+        deltas = {}
+        for name, param in params.items():
+            deltas[name] = torch.empty_like(param).bernoulli_(0.5) * 2 - 1
 
         with torch.no_grad():
             for name, param in params.items():
-                u = self._sample_direction(param)
+                param.data = original_vals[name] + self.eps * deltas[name]
+            f_plus = loss_fn()
+            
+            for name, param in params.items():
+                param.data = original_vals[name] - self.eps * deltas[name]
+            f_minus = loss_fn()
+            
+            for name, param in params.items():
+                param.data = original_vals[name]
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+        delta_loss = f_plus - f_minus
+        grads = {}
+        for name, param in params.items():
+            grads[name] = (delta_loss / (2.0 * self.eps)) * deltas[name]
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
-
-                # Restore original value
-                param.data.add_(self.eps * u)
-
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
-
-        return grads
-        # ------------------------------------------------------------------
+        return grads        # ------------------------------------------------------------------
 
     def _update_params(
         self,
@@ -221,6 +216,35 @@ class ZeroOrderOptimizer:
         with torch.no_grad():
             for name, param in params.items():
                 param.data.sub_(self.lr * grads[name])
+
+        #momentum realisation
+        # with torch.no_grad():
+        #     for name, param in params.items():
+        #         if name not in self.momentum_buffer:
+        #             self.momentum_buffer[name] = torch.zeros_like(param.data)
+        #         self.momentum_buffer[name] = self.momentum * self.momentum_buffer[name] + grads[name]
+        #         param.data.sub_(self.lr * self.momentum_buffer[name])
+
+        #Adam realisation
+        # self.step_count += 1
+        
+        # beta1, beta2 = self.betas
+        # bias_correction1 = 1 - beta1 ** self.step_count
+        # bias_correction2 = 1 - beta2 ** self.step_count
+        
+        # with torch.no_grad():
+        #     for name, param in params.items():
+        #         grad = grads[name]
+                
+        #         if name not in self.m_buffer:
+        #             self.m_buffer[name] = torch.zeros_like(param.data)
+        #             self.v_buffer[name] = torch.zeros_like(param.data)
+
+        #         self.m_buffer[name] = beta1 * self.m_buffer[name] + (1 - beta1) * grad
+        #         self.v_buffer[name] = beta2 * self.v_buffer[name] + (1 - beta2) * (grad * grad)
+        #         m_hat = self.m_buffer[name] / bias_correction1
+        #         v_hat = self.v_buffer[name] / bias_correction2
+        #         param.data.sub_(self.lr * m_hat / (torch.sqrt(v_hat) + self.adam_eps))
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
